@@ -1,0 +1,125 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns:secure-properties="http://www.mulesoft.org/schema/mule/secure-properties"
+	xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:batch="http://www.mulesoft.org/schema/mule/batch"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns:os="http://www.mulesoft.org/schema/mule/os"
+	xmlns:sftp="http://www.mulesoft.org/schema/mule/sftp"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+http://www.mulesoft.org/schema/mule/batch http://www.mulesoft.org/schema/mule/batch/current/mule-batch.xsd
+http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+http://www.mulesoft.org/schema/mule/sftp http://www.mulesoft.org/schema/mule/sftp/current/mule-sftp.xsd
+http://www.mulesoft.org/schema/mule/secure-properties http://www.mulesoft.org/schema/mule/secure-properties/current/mule-secure-properties.xsd">
+    
+    <sftp:config name="Sftp_Config" doc:name="SFTP Config" doc:id="87eeb4d0-acbf-4942-ac89-ee84fb307ce3" >
+		<sftp:connection host="eu-west-1.sftpcloud.io" username="58f36cf4a5384666b3953426e3c41d4b" password="FyPmSYp69dlCq8q6jlJ9CTrAxBV17VMw" />
+	</sftp:config>
+    
+    <os:object-store name="Record_Outcome_Store" persistent="false" doc:name="Record Outcome Store" entryTtl="48" entryTtlUnit="HOURS" expirationIntervalUnit="HOURS" config-ref="ObjectStore_Config"/>
+    <os:config name="ObjectStore_Config" doc:name="ObjectStore Config" doc:id="4fb20bc4-d0c5-4e38-9f5f-c72bf1a8dcbe" >
+        <os:connection >
+            <reconnection failsDeployment="true" >
+                <reconnect />
+            </reconnection>
+        </os:connection>
+    </os:config>
+	
+	<configuration doc:name="Configuration" doc:id="6c3d41f4-5efb-4421-8957-e77660b0eb58" defaultErrorHandler-ref="sftpGlobalErroHandeler" />
+
+	<error-handler name="sftpGlobalErroHandeler">
+        <on-error-continue type="OS:INVALID_KEY" logException="false">
+            <logger level="ERROR" doc:name="Log OS:INVALID_KEY"
+                message="#['[OS:INVALID_KEY] Key not valid in Object Store | File: ' ++ (vars.sourceFileName default 'UNKNOWN') ++ ' | Details: ' ++ error.description]" />
+            <sftp:move config-ref="Sftp_Config" doc:name="Move Failed File to Error" sourcePath="#['/sftp-input-folder/' ++ vars.sourceFileName]"
+                targetPath="/error" overwrite="true"/>
+        </on-error-continue>
+
+        <on-error-continue type="OS:KEY_ALREADY_EXISTS" logException="false">
+            <logger level="ERROR" doc:name="Log OS:KEY_ALREADY_EXISTS"
+                message="#['[OS:KEY_ALREADY_EXISTS] Duplicate key found | File: ' ++ (vars.sourceFileName default 'UNKNOWN') ++ ' | Details: ' ++ error.description]" />
+            <sftp:move config-ref="Sftp_Config" doc:name="Move Failed File to Error" sourcePath="#['/sftp-input-folder/' ++ vars.sourceFileName]"
+                targetPath="/error" overwrite="true" />
+        </on-error-continue>
+
+        <on-error-continue type="OS:LOCK_TIMEOUT" logException="false">
+            <logger level="ERROR" doc:name="Log OS:LOCK_TIMEOUT"
+                message="#['[OS:LOCK_TIMEOUT] Lock timeout occurred | File: ' ++ (vars.sourceFileName default 'UNKNOWN') ++ ' | Details: ' ++ error.description]" />
+        </on-error-continue>
+
+        <on-error-continue type="OS:NULL_VALUE" logException="false">
+            <logger level="ERROR" doc:name="Log OS:NULL_VALUE"
+                message="#['[OS:NULL_VALUE] Null value attempted to store | File: ' ++ (vars.sourceFileName default 'UNKNOWN') ++ ' | Details: ' ++ error.description]" />
+            <sftp:move config-ref="Sftp_Config" doc:name="Move Failed File to Error" sourcePath="#['/sftp-input-folder/' ++ vars.sourceFileName]"
+                targetPath="/error" overwrite="true"/>
+        </on-error-continue>
+
+        <on-error-continue type="OS:STORE_NOT_AVAILABLE" logException="false">
+            <logger level="ERROR" doc:name="Log OS:STORE_NOT_AVAILABLE"
+                message="#['[OS:STORE_NOT_AVAILABLE] Object Store service is down | File: ' ++ (vars.sourceFileName default 'UNKNOWN') ++ ' | Details: ' ++ error.description]" />
+        </on-error-continue>
+
+        <on-error-continue type="SFTP:ACCESS_DENIED" logException="false">
+            <logger level="ERROR" doc:name="Log SFTP:ACCESS_DENIED"
+                message="#['[SFTP:ACCESS_DENIED] Permission issue on SFTP server | File: ' ++ (vars.sourceFileName default 'UNKNOWN') ++ ' | Details: ' ++ error.description]" />
+        </on-error-continue>
+
+        <on-error-continue type="SFTP:CONNECTIVITY" logException="true">
+            <logger level="ERROR" doc:name="Log SFTP:CONNECTIVITY"
+                message="#['[SFTP:CONNECTIVITY] Server connection failed | File: ' ++ (vars.sourceFileName default 'UNKNOWN') ++ ' | Details: ' ++ error.description]" />
+        </on-error-continue>
+
+        <on-error-continue type="SFTP:FILE_ALREADY_EXISTS" logException="false">
+            <logger level="ERROR" doc:name="Log SFTP:FILE_ALREADY_EXISTS"
+                message="#['[SFTP:FILE_ALREADY_EXISTS] Target file already exists | File: ' ++ (vars.sourceFileName default 'UNKNOWN') ++ ' | Details: ' ++ error.description]" />
+            <sftp:move config-ref="Sftp_Config" doc:name="Move Failed File to Error" sourcePath="#['/sftp-input-folder/' ++ vars.sourceFileName]"
+                targetPath="/error" overwrite="true" />
+        </on-error-continue>
+
+        <on-error-continue type="SFTP:FILE_DOESNT_EXIST" logException="false">
+            <logger level="ERROR" doc:name="Log SFTP:FILE_DOESNT_EXIST"
+                message="#['[SFTP:FILE_DOESNT_EXIST] File not found to process | File: ' ++ (vars.sourceFileName default 'UNKNOWN') ++ ' | Details: ' ++ error.description]" />
+        </on-error-continue>
+
+        <on-error-continue type="SFTP:FILE_LOCK" logException="false">
+            <logger level="ERROR" doc:name="Log SFTP:FILE_LOCK"
+                message="#['[SFTP:FILE_LOCK] File locked by another process | File: ' ++ (vars.sourceFileName default 'UNKNOWN') ++ ' | Details: ' ++ error.description]" />
+        </on-error-continue>
+
+        <on-error-continue type="SFTP:ILLEGAL_CONTENT" logException="false">
+            <logger level="ERROR" doc:name="Log SFTP:ILLEGAL_CONTENT"
+                message="#['[SFTP:ILLEGAL_CONTENT] Invalid/corrupt file content | File: ' ++ (vars.sourceFileName default 'UNKNOWN') ++ ' | Details: ' ++ error.description]" />
+            <sftp:move config-ref="Sftp_Config" doc:name="Move Failed File to Error" sourcePath="#['/sftp-input-folder/' ++ vars.sourceFileName]"
+                targetPath="/error" overwrite="true" />
+        </on-error-continue>
+
+        <on-error-continue type="SFTP:ILLEGAL_PATH" logException="false">
+            <logger level="ERROR" doc:name="Log SFTP:ILLEGAL_PATH"
+                message="#['[SFTP:ILLEGAL_PATH] Invalid file path configured | File: ' ++ (vars.sourceFileName default 'UNKNOWN') ++ ' | Details: ' ++ error.description]" />
+        </on-error-continue>
+
+        <on-error-continue type="SFTP:RETRY_EXHAUSTED" logException="false">
+            <logger level="ERROR" doc:name="Log SFTP:RETRY_EXHAUSTED"
+                message="#['[SFTP:RETRY_EXHAUSTED] Max retries reached for SFTP call | File: ' ++ (vars.sourceFileName default 'UNKNOWN') ++ ' | Details: ' ++ error.description]" />
+        </on-error-continue>
+
+        <on-error-continue type="SFTP:SFTP_ERROR" logException="false">
+            <logger level="ERROR" doc:name="Log SFTP:SFTP_ERROR"
+                message="#['[SFTP:SFTP_ERROR] Generic SFTP error occurred | File: ' ++ (vars.sourceFileName default 'UNKNOWN') ++ ' | Details: ' ++ error.description]" />
+        </on-error-continue>
+
+        <on-error-continue type="EXPRESSION" logException="false">
+            <logger level="ERROR" doc:name="Log EXPRESSION Error"
+                message="#['[EXPRESSION ERROR] DataWeave evaluation failed | File: ' ++ (vars.sourceFileName default 'UNKNOWN') ++ ' | Details: ' ++ error.description]" />
+            <sftp:move config-ref="Sftp_Config" doc:name="Move Failed File to Error" sourcePath="#['/sftp-input-folder/' ++ vars.sourceFileName]"
+                targetPath="/error" overwrite="true" />
+        </on-error-continue>
+		<on-error-continue enableNotifications="true" logException="true" doc:name="On Error Continue" doc:id="32c45f7d-2740-4e7d-a6a7-97f50b9162a5" >
+			<logger level="INFO" doc:name="Log Any" doc:id="bafcbe88-6b8c-4b34-b56f-d5c61e3f1c42" message='#["Error Occured"]' />
+		</on-error-continue>
+    
+</error-handler>
+</mule>

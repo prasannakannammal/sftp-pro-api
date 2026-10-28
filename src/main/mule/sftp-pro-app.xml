@@ -1,0 +1,258 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns:ms-einstein-ai="http://www.mulesoft.org/schema/mule/ms-einstein-ai"
+	xmlns:secure-properties="http://www.mulesoft.org/schema/mule/secure-properties"
+	xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:batch="http://www.mulesoft.org/schema/mule/batch"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns:os="http://www.mulesoft.org/schema/mule/os"
+	xmlns:sftp="http://www.mulesoft.org/schema/mule/sftp" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+http://www.mulesoft.org/schema/mule/batch http://www.mulesoft.org/schema/mule/batch/current/mule-batch.xsd
+http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+http://www.mulesoft.org/schema/mule/sftp http://www.mulesoft.org/schema/mule/sftp/current/mule-sftp.xsd
+http://www.mulesoft.org/schema/mule/secure-properties http://www.mulesoft.org/schema/mule/secure-properties/current/mule-secure-properties.xsd
+http://www.mulesoft.org/schema/mule/ms-einstein-ai http://www.mulesoft.org/schema/mule/ms-einstein-ai/current/mule-ms-einstein-ai.xsd">
+	
+	<flow name="process-customer-file-flow">
+        <sftp:listener doc:name="On New or Updated File" doc:id="1d60f155-0611-4336-b038-bda7d4862298" directory="/sftp-input-folder" config-ref="Sftp_Config">
+			<scheduling-strategy >
+				<fixed-frequency frequency="5" timeUnit="MINUTES"/>
+			</scheduling-strategy>
+			<sftp:matcher filenamePattern="customer_accounts_*.csv"/>
+		</sftp:listener>
+		<set-variable variableName="sourceFileName" value="#[attributes.fileName]" doc:name="Set sourceFileName" />
+        <set-variable variableName="runId" value="#[correlationId]" doc:name="Set runId" />
+        <logger level="INFO" message="#['Processing file: ' ++ vars.sourceFileName]" doc:name="Log File Name" />
+        <ee:transform doc:name="Validate Records">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+input payload application/csv header=true
+output application/java
+
+var emailPattern = /^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/
+var numberPattern = /^[0-9]+(\.[0-9]+)?$/
+
+var rows = (payload default []) as Array<Object>
+
+fun reasonFor(r: Object): String | Null = do {
+    var accountNumber = r.AccountNumber as String default ""
+    var customerName  = r.CustomerName  as String default ""
+    var email         = r.Email         as String default ""
+    var country       = r.Country       as String default ""
+    var revenue       = r.AnnualRevenue as String default ""
+    ---
+    if (isBlank(accountNumber)) "Missing AccountNumber"
+    else if (isBlank(customerName)) "Missing CustomerName"
+    else if (isBlank(email) or not (email matches emailPattern)) "Invalid Email"
+    else if (isBlank(country)) "Missing Country"
+    else if (isBlank(revenue) or not (revenue matches numberPattern)) "AnnualRevenue is not numeric"
+    else if ((revenue as Number) <= 0) "AnnualRevenue must be greater than 0"
+    else null
+}
+var checked = rows map (row) -> {
+    row: row,
+    reason: reasonFor(row)
+}
+---
+{
+    valid: (checked filter (value) -> value.reason == null) map (value) ->
+        value.row ++ { AnnualRevenue: value.row.AnnualRevenue as Number },
+
+    rejected: (checked filter (value) -> value.reason != null) map (value) -> {
+        AccountNumber: value.row.AccountNumber default "",
+        Status: "REJECTED",
+        RiskLevel: "",
+        Message: value.reason
+    }
+}]]>
+                </ee:set-payload>
+            </ee:message>
+        </ee:transform>
+		<set-variable variableName="rejectedRows" value="#[payload.rejected]" doc:name="Set rejectedRows" />
+        <!-- CHECK: Any Valid Records Present? -->
+        <choice doc:name="Has Valid Records?">
+            <when expression="#[sizeOf(payload.valid) &gt; 0]">
+                <set-payload value="#[output application/java --- payload.valid]" doc:name="Keep Valid Records Only" />
+                <!-- 2. Batch Job starts only if valid records exist -->
+                <batch:job jobName="customer-risk-batch-job" maxFailedRecords="-1">
+                    <batch:process-records>
+                        <batch:step name="score-and-upsert-step-batchStep">
+                            <batch:aggregator doc:name="Aggregate 200 Records" size="200">
+                                <set-variable variableName="chunkRecords" value="#[payload]" doc:name="Set chunkRecords" />
+                                <set-variable variableName="einsteinFailed" value="#[false]" doc:name="Set einsteinFailed" />
+                                <ee:transform doc:name="Chunk to JSON">
+                                    <ee:message>
+                                        <ee:set-payload>
+                                            <![CDATA[%dw 2.0
+output application/json
+---
+payload]]>
+                                        </ee:set-payload>
+                                    </ee:message>
+                                </ee:transform>
+                                <try doc:name="Isolate Einstein Failure (Try)">
+                                    <until-successful maxRetries="2" millisBetweenRetries="3000" doc:name="Retry Einstein Call (Until Successful)">
+                                        <http:request method="POST" responseTimeout="10000" doc:name="Get Risk Score (Einstein)" url="https://sftp-salesforce-sys-api-js6xtf.5sc6y6-1.usa-e2.cloudhub.io/api/riskPredictor">
+                                            <http:headers ><![CDATA[#[{
+	"client_id": "e11c3d7265f74f45b61d28e23030a9e0",
+	"client_secret": "7930aC05f0eE46f4bec1B8401A9E31a8"
+}]]]>
+                                            </http:headers>
+                                        </http:request>
+                                    
+</until-successful>
+                                    <error-handler>
+                                        <on-error-continue type="ANY" doc:name="Einstein Failed(on error continue)">
+                                            <set-variable variableName="einsteinFailed" value="#[true]" doc:name="Set einsteinFailed = true" />
+                                            <logger level="ERROR" message="#['Einstein failed after retries: ' ++ (error.description default '')]" doc:name="Log Einstein Failure" />
+                                        </on-error-continue>
+                                    </error-handler>
+                                </try>
+                                <choice doc:name="Einstein OK?">
+                                    <when expression="#[vars.einsteinFailed]">
+                                        <ee:transform doc:name="Build FAILED Outcomes">
+                                            <ee:message>
+                                                <ee:set-payload><![CDATA[%dw 2.0
+output application/java
+---
+vars.chunkRecords map (value) -> {
+  AccountNumber: value.AccountNumber,
+  Status: "FAILED",
+  RiskLevel: "",
+  Message: "Einstein Timeout"
+} ]]>
+                                                </ee:set-payload>
+                                            </ee:message>
+                                        </ee:transform>
+                                    </when>
+                                    <otherwise>
+                                        <set-variable variableName="enriched" value="#[output application/java --- []]" doc:name="Init enriched" />
+                                        <foreach doc:name="Classify Risk Level (For Each + Choice)" collection="#[payload]">
+                                            <choice doc:name="Risk Level">
+                                                <when expression="#[payload.riskScore &gt;= 0.80]">
+                                                    <set-variable variableName="riskLevel" value="HIGH" doc:name="HIGH" />
+                                                </when>
+                                                <when expression="#[payload.riskScore &gt;= 0.50]">
+                                                    <set-variable variableName="riskLevel" value="MEDIUM" doc:name="MEDIUM" />
+                                                </when>
+                                                <otherwise>
+                                                    <set-variable variableName="riskLevel" value="LOW" doc:name="LOW" />
+                                                </otherwise>
+                                            </choice>
+                                            <set-variable variableName="enriched" value='#[output application/java --- ((vars.enriched default []) as Array&lt;Object&gt;) ++ [(payload as Object) ++ {riskLevel: (vars.riskLevel default "") as String}]]' doc:name="Append riskLevel" />
+                                        </foreach>
+                                        <ee:transform doc:name="Enriched to JSON">
+                                            <ee:message>
+                                                <ee:set-payload>
+                                                    <![CDATA[%dw 2.0
+output application/json
+---
+vars.enriched]]>
+                                                </ee:set-payload>
+                                            </ee:message>
+                                        </ee:transform>
+                                        <set-variable variableName="salesforceError" value="#[null]" doc:name="Reset salesforceError" />
+                                        <try doc:name="Isolate Salesforce Failure (Try)">
+                                            <until-successful maxRetries="3" doc:name="Until Successful" doc:id="f1536139-21e3-406d-9ce0-155212ca3081" millisBetweenRetries="3000">
+												<http:request method="POST" doc:name="Upsert Accounts (Salesforce Sys API)" url="https://sftp-salesforce-sys-api-js6xtf.5sc6y6-1.usa-e2.cloudhub.io/api/salesforce">
+                                                <http:headers><![CDATA[#[{
+	"client_id": "e11c3d7265f74f45b61d28e23030a9e0",
+	"client_secret": "7930aC05f0eE46f4bec1B8401A9E31a8"
+}]]]>
+                                                </http:headers>
+                                            </http:request>
+											</until-successful>
+											<error-handler>
+                                                <on-error-continue type="ANY" doc:name="Salesforce Failed">
+                                                    <set-variable variableName="salesforceError" value="#[error.description]" doc:name="Set salesforceError" />
+                                                    <logger level="ERROR" message="#['Salesforce upsert failed: ' ++ (vars.salesforceError default '')]" doc:name="Log Salesforce Failure" />
+                                                </on-error-continue>
+                                            </error-handler>
+                                        </try>
+                                        <ee:transform doc:name="Build Processed Outcomes">
+                                            <ee:message>
+                                                <ee:set-payload>
+                                                    <![CDATA[%dw 2.0
+output application/java
+---
+vars.enriched map (value) -> {
+  AccountNumber: value.AccountNumber,
+  Status: if (isEmpty(vars.salesforceError)) "SUCCESS" else "FAILED",
+  RiskLevel: value.riskLevel,
+  Message: if (isEmpty(vars.salesforceError)) "Sent to Salesforce" else vars.salesforceError
+}]]>
+                                                </ee:set-payload>
+                                            </ee:message>
+                                        </ee:transform>
+                                    </otherwise>
+                                </choice>
+                                <os:store key="#[vars.runId ++ '-' ++ uuid()]" objectStore="Record_Outcome_Store" doc:name="Save Chunk Outcomes" config-ref="ObjectStore_Config" />
+                            </batch:aggregator>
+                        </batch:step>
+                    </batch:process-records>
+                    <!-- 3. Report + Archive/Error (After Batch Finishes) -->
+                    <batch:on-complete>
+                        <logger level="INFO" message="#['Batch complete for file: ' ++ vars.sourceFileName]" doc:name="Log On Complete" />
+                        <os:retrieve-all objectStore="Record_Outcome_Store" doc:name="Read All Chunk Outcomes" config-ref="ObjectStore_Config"/>
+                        <ee:transform doc:name="Merge Rejected and Processed Rows">
+                            <ee:message>
+                                <ee:set-payload>
+                                    <![CDATA[%dw 2.0
+output application/java
+---
+(vars.rejectedRows default []) ++
+flatten(
+    (payload filterObject ((value, key) -> (key as String) startsWith vars.runId))
+    pluck ((value) -> value)
+)]]>
+                                </ee:set-payload>
+                            </ee:message>
+                        </ee:transform>
+                        <set-variable variableName="allOutcomes" value="#[payload]" doc:name="Set allOutcomes" />
+                        <set-variable variableName="successCount" value="#[sizeOf(vars.allOutcomes filter ((value) -&gt; value.Status == 'SUCCESS'))]" doc:name="Set successCount" />
+                        <ee:transform doc:name="Build Processing Report (CSV)">
+                            <ee:message>
+                                <ee:set-payload>
+                                    <![CDATA[%dw 2.0
+output application/csv header=true
+---
+vars.allOutcomes]]>
+                                </ee:set-payload>
+                            </ee:message>
+                        </ee:transform>
+                        <sftp:write config-ref="Sftp_Config" path='#["/reports/report_" ++ vars.sourceFileName]' doc:name="Write Processing Report" />
+                        <choice doc:name="Any Record Succeeded?">
+                            <when expression="#[vars.successCount &gt; 0]">
+                                <sftp:move config-ref="Sftp_Config" sourcePath="#['/sftp-input-folder/' ++ vars.sourceFileName]" overwrite="true" doc:name="Move File to Archive" targetPath="/archive"/>
+                            </when>
+                            <otherwise>
+                                <sftp:move config-ref="Sftp_Config" sourcePath="#['/sftp-input-folder/' ++ vars.sourceFileName]" targetPath="/error" overwrite="true" doc:name="Move File to Error" />
+                            </otherwise>
+                        </choice>
+                        <os:clear objectStore="Record_Outcome_Store" doc:name="Clear Outcome Store" config-ref="ObjectStore_Config"/>
+                    </batch:on-complete>
+                </batch:job>
+            </when>
+            <otherwise>
+                <logger level="WARN" message="#['All records rejected during validation for file: ' ++ vars.sourceFileName ++ '. Skipping Batch.']" doc:name="Log All Rejected" />
+                <ee:transform doc:name="Build Rejected Only Report (CSV)">
+                    <ee:message>
+                        <ee:set-payload>
+                            <![CDATA[%dw 2.0
+output application/csv header=true
+---
+vars.rejectedRows default []]]>
+                        </ee:set-payload>
+                    </ee:message>
+                </ee:transform>
+                <sftp:write config-ref="Sftp_Config" path='#["/reports/report_" ++ vars.sourceFileName]' doc:name="Write Rejected Report"/>
+                <sftp:move config-ref="Sftp_Config" sourcePath="#['/sftp-input-folder/' ++ vars.sourceFileName]" targetPath="/error" overwrite="true" doc:name="Move Direct to Error"/>
+            </otherwise>
+        </choice>
+		<error-handler ref="sftpGlobalErroHandeler" />
+    
+</flow>
+</mule>
